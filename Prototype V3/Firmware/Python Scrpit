@@ -1,0 +1,319 @@
+"""
+DIGITAL MAGNETIC PEN  —  Rotation-vector odometry
+==================================================
+Key insight: stop tracking absolute dipole angle (needs a reference).
+Instead track HOW MUCH the dipole rotates between consecutive frames.
+
+    rot_vec = cross(m_prev, m_curr)   ← axis × sin(angle)
+    canvas_X  += rot_vec.Y × MM_PER_RAD   (rotation around Y → move right)
+    canvas_Y  += rot_vec.X × MM_PER_RAD   (rotation around X → move down)
+    rot_vec.Z  is spin around pen axis     ← contributes NOTHING to canvas
+
+This is:
+  ✓ Reference-free  — doesn't matter where the ball rests between strokes
+  ✓ Spin-immune     — free Z spin never moves the canvas
+  ✓ Zero drift      — pen lifted = dipole still = cross product ≈ 0 = no draw
+  ✓ No calibration  — pure physics
+
+Lifting = dipole stops moving = no stroke. Simple.
+
+Hardware:
+  Sensor 1: (+0.8,  0.0, +1.2) cm from magnet centre
+  Sensor 2: (-0.8,  0.0, +1.2) cm from magnet centre
+  Magnet  : 5 mm sphere, free-rolling
+
+Serial: ax,ay,az,m1x,m1y,m1z,m2x,m2y,m2z  @115200
+"""
+
+import numpy as np
+from scipy.spatial import KDTree
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.patches import FancyBboxPatch
+from mpl_toolkits.mplot3d import Axes3D
+import threading, queue, time
+
+COM_PORT    = 'COM6'
+BAUD_RATE   = 115200
+
+# Tune this: if 1cm stroke draws 3cm → set MM_PER_RAD /= 3
+MM_PER_RAD  = 200.0
+
+# EMA on the 6-vec before KD lookup (smooths sensor noise)
+SIG_EMA     = 0.80
+
+# Motion threshold: cross product magnitude below this → pen is still → don't draw
+# This is the key gate: lifted pen = no ball movement = near-zero cross product
+STILL_THRESH = 0.008   # radians per frame (~0.5°) — tune down if too sensitive
+
+A4_W, A4_H  = 210.0, 297.0
+MARGIN      = 8.0
+S1 = np.array([ 0.8,  0.0,  1.2])
+S2 = np.array([-0.8,  0.0,  1.2])
+
+data_queue    = queue.Queue(maxsize=500)
+serial_status = {'msg': 'Building KD-tree…', 'ok': False}
+
+canvas_pts  = [[A4_W/2, A4_H/2]]
+raw_ema     = None
+m_prev      = None      # previous dipole unit vector
+
+kdtree      = None
+kd_dipoles  = None
+
+live = {'rx':0,'mx':0.,'my':0.,'mz':0.,
+        'rv':np.zeros(3),'dx':0.,'dy':0.,'still':True}
+
+
+# ── PHYSICS ───────────────────────────────────────────────────────────────────
+def dfield(m, r):
+    rn = np.linalg.norm(r); rh = r/rn
+    return (3*np.dot(m,rh)*rh - m)/rn**3
+
+def build_kdtree(step=1):
+    print("[KD] Building…", flush=True)
+    t0 = time.time()
+    thetas = np.radians(np.arange(0, 181, step))
+    phis   = np.radians(np.arange(0, 360, step))
+    vecs, dips = [], []
+    for th in thetas:
+        st, ct = np.sin(th), np.cos(th)
+        for ph in phis:
+            m  = np.array([st*np.cos(ph), st*np.sin(ph), ct])
+            sv = np.concatenate([dfield(m,S1), dfield(m,S2)])
+            n  = np.linalg.norm(sv)
+            if n > 1e-12:
+                vecs.append(sv/n); dips.append(m)
+    vecs = np.array(vecs, dtype=np.float32)
+    dips = np.array(dips, dtype=np.float32)
+    tree = KDTree(vecs)
+    print(f"[KD] {len(vecs):,} entries  {time.time()-t0:.1f}s")
+    return tree, dips
+
+def ema_fn(prev, curr, a):
+    return curr.copy() if prev is None else a*prev + (1-a)*curr
+
+def get_dipole(b1, b2):
+    """Raw sensor → normalised 6-vec → KD lookup → unit dipole vector."""
+    sv = np.concatenate([b1, b2])
+    n  = np.linalg.norm(sv)
+    if n < 1e-9: return None, 9.
+    sv = (sv/n).astype(np.float32)
+    d, i = kdtree.query(sv)
+    return kd_dipoles[i].astype(float), float(d)
+
+
+# ── SERIAL ────────────────────────────────────────────────────────────────────
+def serial_reader():
+    import serial, serial.tools.list_ports
+    print(f"[Serial] {[p.device for p in serial.tools.list_ports.comports()]}")
+    ser = None
+    while ser is None:
+        try:
+            ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=2)
+            serial_status.update(msg=f'✓ {COM_PORT}', ok=True)
+        except Exception as e:
+            serial_status.update(msg=f'✗ {e}', ok=False); time.sleep(2)
+    while True:
+        try:
+            parts = ser.readline().decode('utf-8','ignore').strip().split(',')
+            if len(parts) != 9: continue
+            v = [float(x) for x in parts]
+            live['rx'] += 1
+            if not data_queue.full():
+                data_queue.put_nowait({'m1': np.array(v[3:6]),
+                                       'm2': np.array(v[6:])})
+            serial_status['msg'] = f'✓ {COM_PORT}  rx:{live["rx"]}'
+        except ValueError: pass
+        except Exception as e:
+            serial_status.update(msg=f'✗ {e}', ok=False)
+            import serial as _s; ser=None; time.sleep(2)
+            while ser is None:
+                try: ser=_s.Serial(COM_PORT,BAUD_RATE,timeout=2); serial_status.update(ok=True)
+                except: time.sleep(2)
+
+
+# ── FIGURE ────────────────────────────────────────────────────────────────────
+def build_figure():
+    DPI=96; PX_MM=2.5
+    cw=(A4_W+2*MARGIN)*PX_MM/DPI; ch=(A4_H+2*MARGIN)*PX_MM/DPI
+    fig = plt.figure(figsize=(cw*2+0.2, ch+0.9), facecolor='#1a1a2e')
+    fig.canvas.manager.set_window_title('✍  Digital Pen')
+
+    # 3D dipole viewer (left)
+    ax3 = fig.add_axes([0.01, 0.10, 0.44, 0.87], projection='3d')
+    ax3.set_facecolor('#0d0d1a')
+    ax3.set_xlim(-1.3,1.3); ax3.set_ylim(-1.3,1.3); ax3.set_zlim(-1.3,1.3)
+    ax3.set_xlabel('X',color='#666',fontsize=8)
+    ax3.set_ylabel('Y',color='#666',fontsize=8)
+    ax3.set_zlabel('Z',color='#666',fontsize=8)
+    ax3.tick_params(colors='#333',labelsize=6)
+    for p in [ax3.xaxis.pane,ax3.yaxis.pane,ax3.zaxis.pane]:
+        p.fill=False; p.set_edgecolor('#111133')
+    ax3.set_title('Dipole (live)', color='#00e5ff', fontsize=9, pad=3)
+    for v,c in [([1,0,0],'#440000'),([0,1,0],'#004400'),([0,0,1],'#000044')]:
+        ax3.quiver(0,0,0,*v,length=0.8,color=c,alpha=0.5,
+                   arrow_length_ratio=0.15,linewidth=0.8)
+    ax3.scatter(*S1,color='#39ff14',s=55,zorder=5)
+    ax3.scatter(*S2,color='#ffe066',s=55,zorder=5)
+    ax3.text(*(S1+[.05,.05,.05]),'S1',color='#39ff14',fontsize=7)
+    ax3.text(*(S2+[.05,.05,.05]),'S2',color='#ffe066',fontsize=7)
+    qh = [None]
+
+    # A4 canvas (right)
+    ax2 = fig.add_axes([0.47, 0.10, 0.52, 0.87])
+    ax2.set_facecolor('#2b2b3b')
+    ax2.set_xlim(-MARGIN, A4_W+MARGIN)
+    ax2.set_ylim(-MARGIN, A4_H+MARGIN)
+    ax2.set_aspect('equal'); ax2.axis('off')
+    ax2.add_patch(FancyBboxPatch((0,0),A4_W,A4_H,
+        boxstyle='round,pad=0',lw=1.5,edgecolor='#aaaacc',facecolor='#fafaf5',zorder=1))
+    for y in np.arange(5,A4_H,5):
+        ax2.plot([0,A4_W],[y,y],color='#c8d8e8',lw=0.5 if y%10==0 else 0.18,zorder=2)
+    for x in np.arange(5,A4_W,5):
+        ax2.plot([x,x],[0,A4_H],color='#c8d8e8',lw=0.5 if x%10==0 else 0.18,zorder=2)
+    for xm in [20,A4_W-20]:
+        ax2.plot([xm,xm],[0,A4_H],color='#f4a0a0',lw=0.7,ls='--',zorder=3)
+    (stroke,)=ax2.plot([],[],color='#1a237e',lw=1.8,
+                       solid_capstyle='round',solid_joinstyle='round',zorder=5)
+    (dot,)   =ax2.plot([A4_W/2],[A4_H/2],'o',color='#e53935',ms=7,zorder=6)
+    # "pen moving" indicator on canvas
+    state_txt = ax2.text(A4_W/2, A4_H+4, '', ha='center',
+                         fontsize=9, fontweight='bold', color='#888', zorder=7)
+
+    # Status
+    s1=fig.text(0.01,0.062,'',color='#44ff88',fontsize=7,family='monospace',va='bottom')
+    s2=fig.text(0.01,0.038,'',color='#99aacc',fontsize=7,family='monospace',va='bottom')
+    s3=fig.text(0.01,0.014,'',color='#ffcc44',fontsize=7,family='monospace',va='bottom')
+
+    def make_btn(left,w,label,col):
+        b=fig.add_axes([left,0.008,w,0.032])
+        b.set_facecolor('#1a1a2e')
+        for sp in b.spines.values(): sp.set_edgecolor(col)
+        b.set_xticks([]); b.set_yticks([])
+        b.text(0.5,0.5,label,transform=b.transAxes,ha='center',va='center',
+               color=col,fontsize=9,fontweight='bold',family='monospace')
+        return b
+
+    btn_clear = make_btn(0.78, 0.13, '🗑 Clear', '#8888ff')
+
+    return fig,ax3,qh,stroke,dot,state_txt,s1,s2,s3,btn_clear
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def run():
+    global kdtree, kd_dipoles, raw_ema, m_prev, canvas_pts
+
+    kdtree, kd_dipoles = build_kdtree(step=1)
+    serial_status['msg'] = f'KD ready ({len(kd_dipoles):,}). Connecting {COM_PORT}…'
+
+    threading.Thread(target=serial_reader, daemon=True).start()
+
+    fig,ax3,qh,stroke,dot,state_txt,s1,s2,s3,btn_clear = build_figure()
+
+    def on_click(event):
+        global canvas_pts, raw_ema, m_prev
+        if btn_clear.contains(event)[0]:
+            canvas_pts.clear(); canvas_pts.append([A4_W/2,A4_H/2])
+            raw_ema = None; m_prev = None
+            stroke.set_data([],[]); dot.set_data([A4_W/2],[A4_H/2])
+
+    fig.canvas.mpl_connect('button_press_event', on_click)
+
+    def update(_frame):
+        global raw_ema, m_prev, canvas_pts
+
+        s1.set_text(serial_status['msg'])
+        s1.set_color('#44ff88' if serial_status['ok'] else '#ff6644')
+
+        pkts=[]
+        while not data_queue.empty(): pkts.append(data_queue.get_nowait())
+        if not pkts: return
+
+        for pkt in pkts:
+            b1,b2 = pkt['m1'], pkt['m2']
+            mag   = (np.linalg.norm(b1)+np.linalg.norm(b2))/2
+            if mag < 1e-9: continue
+
+            # ── 1. Smooth raw 6-vec ───────────────────────────────────────
+            sv = np.concatenate([b1,b2]) / mag
+            sv = sv / max(np.linalg.norm(sv), 1e-12)
+            raw_ema = ema_fn(raw_ema, sv, SIG_EMA)
+
+            # ── 2. KD lookup → current dipole unit vector ─────────────────
+            sv_q = (raw_ema/max(np.linalg.norm(raw_ema),1e-12)).astype(np.float32)
+            _, idx = kdtree.query(sv_q)
+            m_curr = kd_dipoles[idx].astype(float)
+            live.update(mx=float(m_curr[0]),my=float(m_curr[1]),mz=float(m_curr[2]))
+
+            # ── 3. Need two consecutive frames ────────────────────────────
+            if m_prev is None:
+                m_prev = m_curr.copy()
+                continue
+
+            # ── 4. Rotation vector between frames ─────────────────────────
+            #   rv = cross(m_prev, m_curr)
+            #   |rv| ≈ sin(Δangle) ≈ Δangle  for small rotations
+            #   rv direction = rotation axis
+            rv = np.cross(m_prev, m_curr)
+            rot_mag = np.linalg.norm(rv)
+            live['rv'] = rv
+
+            # ── 5. Still-threshold gate ───────────────────────────────────
+            #   Pen lifted → ball still → |rv| ≈ 0 → no drawing
+            #   This is the reference-free solution!
+            still = rot_mag < STILL_THRESH
+            live['still'] = still
+
+            if not still:
+                # rv.Y = rotation around Y-axis → canvas X
+                # rv.X = rotation around X-axis → canvas Y
+                # rv.Z = spin around pen axis   → ignored (never used)
+                dx_mm =  rv[1] * MM_PER_RAD
+                dy_mm =  rv[0] * MM_PER_RAD
+                live['dx'] = dx_mm; live['dy'] = dy_mm
+
+                new_x = np.clip(canvas_pts[-1][0] + dx_mm, 0, A4_W)
+                new_y = np.clip(canvas_pts[-1][1] + dy_mm, 0, A4_H)
+                canvas_pts.append([new_x, new_y])
+
+            m_prev = m_curr.copy()
+
+        # ── Update 3D arrow ───────────────────────────────────────────────
+        if qh[0] is not None:
+            try: qh[0].remove()
+            except: pass
+        mx,my,mz = live['mx'],live['my'],live['mz']
+        qh[0] = ax3.quiver(0,0,0,mx,my,mz,length=1.1,color='#ff2266',
+                            linewidth=3,arrow_length_ratio=0.20,normalize=True)
+
+        # ── Update canvas ─────────────────────────────────────────────────
+        xs=[p[0] for p in canvas_pts]; ys=[p[1] for p in canvas_pts]
+        stroke.set_data(xs,ys); dot.set_data([xs[-1]],[ys[-1]])
+
+        still = live['still']
+        state_txt.set_text('✋ pen lifted — not drawing' if still else '✏  drawing')
+        state_txt.set_color('#ff6600' if still else '#00cc44')
+
+        rv = live['rv']
+        s2.set_text(
+            f'  dipole [{mx:+.3f} {my:+.3f} {mz:+.3f}]'
+            f'   rot_vec [{rv[0]:+.4f} {rv[1]:+.4f} {rv[2]:+.4f}]'
+            f'  |rv|={np.linalg.norm(rv):.4f}'
+        )
+        s3.set_text(
+            f'  ΔX={live["dx"]:+.2f}mm  ΔY={live["dy"]:+.2f}mm'
+            f'   canvas=({xs[-1]:.1f},{ys[-1]:.1f})mm'
+            f'   pts:{len(canvas_pts)}'
+            f'   thresh={STILL_THRESH}'
+        )
+
+    ani = animation.FuncAnimation(
+        fig, update, interval=10,
+        blit=False, cache_frame_data=False,
+    )
+    plt.show()
+
+
+if __name__=='__main__':
+    run()
