@@ -12,7 +12,7 @@ Problems: 1) Cosine method is highly inaccurate for calculating change in angle 
 
 3) Since i made this on bread board loose jumper conections were interupting I2C connections.
 
-4) Current fails to predict orienation of dipole in real time accurately.
+4) Current setup fails to predict orienation of dipole in real time accurately.
 
 
 
