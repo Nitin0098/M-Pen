@@ -1,5 +1,5 @@
 
-Firmware (STM32) changes
+Firmware (STM32) changes (15+ iterations) 
 
 1. Initial firmware written — 20-bit MMC5603, polling mode, 100 Hz, USB CDC format S1:x,y,z;S2:x,y,z
 2. Fixed Error_Handler conflict with CubeMX weak stub
@@ -16,7 +16,7 @@ Firmware (STM32) changes
 13. Bug fix: cdc_send() was blocking up to 50 ms with retries → changed to single non-blocking call
 14. Bug fix: MMC5603_Trigger() (blocking I2C) was called inside TIM2 ISR → moved to main loop, ISR now only sets do_trigger flag.
 
-M-Pen algorithm evolution
+M-Pen algorithm evolution (25+ iterations)
 
 1. V1: scipy.optimize L-BFGS-B dipole fit + cross-product rolling direction + LineCollection blit rendering
 2. Fixed flicker — replaced blit/restore_region with PIL pixel buffer + imshow.set_data() — no blank intermediate frame
@@ -26,17 +26,17 @@ M-Pen algorithm evolution
 6. Removed all filters — pure m_prev × m_curr cross product, no EMA, no dead-zone
 7. Diagnosed zigzag root cause — cross products of nearly-parallel vectors are dominated by noise; also blind axis when both sensors on X axis
 8. Added Option A (analytical φ direction from atan2(dm_y, dm_x)) + Option D (quaternion SLERP smoothing) combined
-Hardware fix (Option B) — moved Sensor 2 from (4cm, 0, 0) to (0, 2cm, 0) — eliminated blind axis entirely. POS_S1=[0.02,0,0], POS_S2=[0,0.02,0]
-Removed A+D pipeline — replaced with clean dm_xy direction mapping, no cross products, no SLERP
-Removed scipy.optimize entirely — replaced with analytical dipole extraction:
+9. Hardware fix (Option B) — moved Sensor 2 from (4cm, 0, 0) to (0, 2cm, 0) — eliminated blind axis entirely. POS_S1=[0.02,0,0], POS_S2=[0,0.02,0]
+10. Removed A+D pipeline — replaced with clean dm_xy direction mapping, no cross products, no SLERP
+11. Removed scipy.optimize entirely — replaced with analytical dipole extraction:
 
-mx = B1x/2 - B2x
-my = B2y/2 - B1y
-mz = -(B1z+B2z)/2
-This was the real root cause of random motion — optimizer finding different local minima each frame
+   mx = B1x/2 - B2x
+   my = B2y/2 - B1y
+   mz = -(B1z+B2z)/2
+   This was the real root cause of random motion — optimizer finding different local minima each frame
 
 
-Switched to KDTree lookup (Approach 1) — pre-computed physics grid at 0.5° resolution, ~130k entries, ~0.1ms query
-Added EMA smoothing on (θ, φ) outputs — circular EMA for φ via (sin φ, cos φ) to handle 0°/360° wrap
+12. witched to KDTree lookup (Approach 1) — pre-computed physics grid at 0.5° resolution, ~130k entries, ~0.1ms query
+13. Added EMA smoothing on (θ, φ) outputs — circular EMA for φ via (sin φ, cos φ) to handle 0°/360° wrap
 Added displacement accumulation gate — only draw stroke when accumulated displacement exceeds MIN_DRAW_MM = 0.15
 Fixed COUNTS_PER_UT in Python — was 163.84 (20-bit), corrected to 10.24 (16-bit)
