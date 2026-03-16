@@ -40,7 +40,7 @@ Added displacement accumulation gate — only draw stroke when accumulated displ
 Fixed COUNTS_PER_UT in Python — was 163.84 (20-bit), corrected to 10.24 (16-bit).
 
 problems
-1. Current algorithm still cannot predict and track dipole orientation accurately, Reason: I placed two magnetometers in opposite sides of a cube, which created a blind axis(Z axis) , rotation of magnetic sphere along Z axis was not tracked due to symmetry of magnetic field and placements of magnetometers.
+1. Current algorithm still cannot predict and track dipole orientation accurately, Reason: I placed two magnetometers in opposite sides of a cube, which created a blind axis(Z axis) , rotation of magnetic sphere along Z axis was not tracked due to symmetry of magnetic field and current placement of magnetometers.
 
 Solution:
 1. place magnetometers in planes perpendicular to each other so solve the blind axis problem.
