@@ -1,0 +1,367 @@
+"""
+MAGNETIC BALL TRACKER  —  3D Visualiser only
+=============================================
+Shows a textured sphere with the dipole arrow inside.
+Sphere surface patterns let you visually verify rolling direction.
+
+Setup:
+  S1: (0, -1.0, +1.1) cm  sensor_x=+X  sensor_y=+Z
+  S2: (+1.2, 0, +1.1) cm  sensor_x=+Y  sensor_y=+Z
+  Accel: sensor_x=-Z  sensor_y=-Y
+
+Serial: ax,ay,az,s1x,s1y,s1z,s2x,s2y,s2z  @115200
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
+import threading, queue, time
+import serial, serial.tools.list_ports
+
+# ── Config ────────────────────────────────────────────────────────────────────
+COM_PORT     = 'COM6'
+BAUD_RATE    = 115200
+ACCEL_SCALE  = 16384.0
+SIG_EMA      = 0.80
+GRAVITY_LP   = 0.95
+CYCLE_FRAMES = 5
+
+# ── Sensor geometry ───────────────────────────────────────────────────────────
+S1_pos = np.array([ 0.0, -1.0,  1.1])
+S2_pos = np.array([ 1.2,  0.0,  1.1])
+
+R_S1 = np.array([[ 1,  0,  0],
+                 [ 0,  0,  1],
+                 [ 0, -1,  0]], dtype=float)
+
+R_S2 = np.array([[ 0,  1,  0],
+                 [ 0,  0,  1],
+                 [ 1,  0,  0]], dtype=float)
+
+R_acc = np.array([[ 0,  0, -1],
+                  [ 0, -1,  0],
+                  [-1,  0,  0]], dtype=float)
+
+def _build_pinv():
+    def jac(r):
+        rn=np.linalg.norm(r); rh=r/rn
+        return (3*np.outer(rh,rh)-np.eye(3))/rn**3
+    A = np.vstack([R_S1@jac(S1_pos), R_S2@jac(S2_pos)])
+    return np.linalg.pinv(A)
+
+PINV_A = _build_pinv()
+
+# ── Physics ───────────────────────────────────────────────────────────────────
+def extract_dipole(r1, r2):
+    sc = (np.linalg.norm(r1)+np.linalg.norm(r2))/2
+    if sc < 1e-9: return None
+    b  = np.concatenate([r1,r2])/sc
+    m  = PINV_A @ b
+    n  = np.linalg.norm(m)
+    return m/n if n>1e-9 else None
+
+def recover_gravity(raw):
+    g = R_acc.T @ raw
+    n = np.linalg.norm(g)
+    return g/n if n>1e-9 else np.array([0.,0.,-1.])
+
+def ema(prev, curr, a):
+    return curr.copy() if prev is None else a*prev+(1-a)*curr
+
+def rodrigues(v, axis, angle):
+    """Rotate vector v around axis by angle (radians)."""
+    axis = axis/np.linalg.norm(axis)
+    return (v*np.cos(angle) +
+            np.cross(axis,v)*np.sin(angle) +
+            axis*np.dot(axis,v)*(1-np.cos(angle)))
+
+# ── State ─────────────────────────────────────────────────────────────────────
+data_queue  = queue.Queue(maxsize=500)
+ser_status  = {'msg':'Connecting…','ok':False}
+
+ema_m       = None
+gravity_lp  = None
+ref_m       = None
+frame_count = 0
+
+# Sphere orientation tracked by integrating rotation vectors
+# Stored as a 3x3 rotation matrix
+sphere_rot  = np.eye(3)
+
+live = {'rx':0, 'm':np.array([0.,0.,1.]),
+        'g':np.array([0.,0.,-1.])}
+
+
+# ── Serial ────────────────────────────────────────────────────────────────────
+def serial_reader():
+    print(f"[Serial] {[p.device for p in serial.tools.list_ports.comports()]}")
+    ser = None
+    while ser is None:
+        try:
+            ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=2)
+            ser_status.update(msg=f'Connected {COM_PORT}', ok=True)
+            print("[Serial] Connected")
+        except Exception as e:
+            ser_status.update(msg=f'Waiting… {e}', ok=False); time.sleep(2)
+    while True:
+        try:
+            parts = ser.readline().decode('utf-8','ignore').strip().split(',')
+            if len(parts) != 9: continue
+            v = [float(x) for x in parts]
+            live['rx'] += 1
+            if not data_queue.full():
+                data_queue.put_nowait({
+                    'accel': np.array(v[0:3])/ACCEL_SCALE,
+                    's1':    np.array(v[3:6]),
+                    's2':    np.array(v[6:9]),
+                })
+            ser_status['msg'] = f'Connected {COM_PORT}  rx:{live["rx"]}'
+        except ValueError: pass
+        except Exception as e:
+            ser_status.update(msg=f'Lost:{e}',ok=False)
+            ser=None; time.sleep(2)
+            while ser is None:
+                try:
+                    ser=serial.Serial(COM_PORT,BAUD_RATE,timeout=2)
+                    ser_status.update(ok=True)
+                except: time.sleep(2)
+
+
+# ── Sphere surface patterns ───────────────────────────────────────────────────
+def make_sphere_lines():
+    """
+    Generate lines on unit sphere:
+    - Latitude lines (horizontal bands)
+    - Longitude lines (meridians)
+    - Equator thicker
+    - A bold X mark at the 'north pole' so you can track spin
+    Returns list of (N,3) arrays, each is one line.
+    """
+    lines = []
+    u = np.linspace(0, 2*np.pi, 60)
+
+    # Latitude lines every 30 degrees
+    for lat_deg in range(-60, 90, 30):
+        lat = np.radians(lat_deg)
+        r   = np.cos(lat)
+        xs  = r * np.cos(u)
+        ys  = r * np.sin(u)
+        zs  = np.sin(lat) * np.ones_like(u)
+        lines.append((np.column_stack([xs,ys,zs]),
+                      '#4444aa' if lat_deg != 0 else '#8888ff', # equator brighter
+                      2.0       if lat_deg != 0 else 3.0))
+
+    # Longitude lines every 45 degrees
+    v = np.linspace(0, np.pi, 30)
+    for lon_deg in range(0, 180, 45):
+        lon = np.radians(lon_deg)
+        xs  = np.sin(v)*np.cos(lon)
+        ys  = np.sin(v)*np.sin(lon)
+        zs  = np.cos(v)
+        lines.append((np.column_stack([xs,ys,zs]), '#2244aa', 1.0))
+        # opposite side
+        xs2 = np.sin(v)*np.cos(lon+np.pi)
+        ys2 = np.sin(v)*np.sin(lon+np.pi)
+        lines.append((np.column_stack([xs2,ys2,zs]), '#2244aa', 1.0))
+
+    # Bold X mark at north pole (Z=+1 face)
+    # Two crossing lines near the north pole
+    for angle in [45, -45]:
+        a = np.radians(angle)
+        t = np.linspace(-0.3, 0.3, 20)
+        xs = t * np.cos(a)
+        ys = t * np.sin(a)
+        zs = np.sqrt(np.clip(1 - xs**2 - ys**2, 0, 1))
+        lines.append((np.column_stack([xs,ys,zs]), '#ff4444', 3.0))
+
+    # Circle around north pole (like a crown)
+    lat2 = np.radians(70)
+    r2   = np.cos(lat2)
+    xs   = r2*np.cos(u); ys=r2*np.sin(u); zs=np.sin(lat2)*np.ones_like(u)
+    lines.append((np.column_stack([xs,ys,zs]), '#ff4444', 2.5))
+
+    # Arrow pointing toward +Y on equator (forward marker)
+    arrow_u = np.linspace(-0.2, 0.2, 20)
+    xs = np.zeros_like(arrow_u)
+    ys = np.sin(arrow_u)
+    zs = np.cos(arrow_u)
+    lines.append((np.column_stack([xs,ys,zs]), '#44ff44', 3.0))
+
+    return lines
+
+SPHERE_LINES_BASE = make_sphere_lines()
+
+
+def rotate_lines(lines, R):
+    """Apply rotation matrix R to all sphere lines."""
+    return [(pts @ R.T, col, lw) for pts, col, lw in lines]
+
+
+# ── Build figure ──────────────────────────────────────────────────────────────
+def build_figure():
+    fig = plt.figure(figsize=(9,8), facecolor='#0d0d1a')
+    fig.canvas.manager.set_window_title('Magnetic Ball Tracker')
+
+    ax = fig.add_axes([0.02, 0.08, 0.96, 0.88], projection='3d')
+    ax.set_facecolor('#0d0d1a')
+    ax.set_xlim(-1.6,1.6); ax.set_ylim(-1.6,1.6); ax.set_zlim(-1.6,1.6)
+    ax.set_xlabel('X', color='#555', fontsize=9)
+    ax.set_ylabel('Y', color='#555', fontsize=9)
+    ax.set_zlabel('Z', color='#555', fontsize=9)
+    ax.tick_params(colors='#333', labelsize=7)
+    for p in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
+        p.fill=False; p.set_edgecolor('#111133')
+    ax.set_title('', color='#00e5ff', fontsize=10, pad=6)
+
+    # World reference axes (faint)
+    for v,c,l in [([1,0,0],'#441111','X'),
+                  ([0,1,0],'#114411','Y'),
+                  ([0,0,1],'#111155','Z')]:
+        ax.quiver(0,0,0,*v,length=1.4,color=c,alpha=0.6,
+                  arrow_length_ratio=0.12,linewidth=0.8)
+        ax.text(*(np.array(v)*1.5), l, color=c, fontsize=8, alpha=0.7)
+
+    # Semi-transparent sphere (wireframe-style)
+    sphere_lc = [None]   # will hold Line3DCollection
+
+    # Dipole arrow (red)
+    dipole_q  = [None]
+    # Gravity arrow (blue)
+    gravity_q = [None]
+
+    # Status text
+    st = fig.text(0.01, 0.02, '',
+                  color='#44ff88', fontsize=8,
+                  family='monospace', va='bottom')
+    st2= fig.text(0.50, 0.02, '',
+                  color='#99aacc', fontsize=8,
+                  family='monospace', va='bottom')
+
+    return fig, ax, sphere_lc, dipole_q, gravity_q, st, st2
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def run():
+    global ema_m, gravity_lp, ref_m, frame_count, sphere_rot
+
+    threading.Thread(target=serial_reader, daemon=True).start()
+    fig, ax, sphere_lc, dipole_q, gravity_q, st, st2 = build_figure()
+
+    frame_n = [0]
+
+    def update(_):
+        global ema_m, gravity_lp, ref_m, frame_count, sphere_rot
+
+        frame_n[0] += 1
+
+        # Drain — latest packet only
+        pkt = None
+        while not data_queue.empty(): pkt = data_queue.get_nowait()
+        if pkt is None: return
+
+        # 1. Dipole
+        m = extract_dipole(pkt['s1'], pkt['s2'])
+        if m is None: return
+        ema_m = ema(ema_m, m, SIG_EMA)
+        mn    = np.linalg.norm(ema_m)
+        if mn < 1e-9: return
+        m_curr = ema_m/mn
+        live['m'] = m_curr
+
+        # 2. Gravity
+        g_raw      = recover_gravity(pkt['accel'])
+        gravity_lp = ema(gravity_lp, g_raw, GRAVITY_LP)
+        g_hat      = gravity_lp/max(np.linalg.norm(gravity_lp),1e-9)
+        live['g']  = g_hat
+
+        # 3. Cyclic reset + sphere rotation update
+        if ref_m is None:
+            ref_m = m_curr.copy(); frame_count=0
+        else:
+            frame_count += 1
+            rv = np.cross(ref_m, m_curr)
+            rv_mag = np.linalg.norm(rv)
+
+            if rv_mag > 1e-6:
+                # Apply this rotation to sphere_rot
+                axis  = rv/rv_mag
+                angle = rv_mag   # small angle approx: |rv| ≈ sin(θ) ≈ θ
+                # Build incremental rotation matrix from axis-angle
+                c=np.cos(angle); s=np.sin(angle); t=1-c
+                x,y,z = axis
+                dR = np.array([
+                    [t*x*x+c,   t*x*y-s*z, t*x*z+s*y],
+                    [t*x*y+s*z, t*y*y+c,   t*y*z-s*x],
+                    [t*x*z-s*y, t*y*z+s*x, t*z*z+c  ]
+                ])
+                sphere_rot = dR @ sphere_rot
+
+            if frame_count >= CYCLE_FRAMES:
+                ref_m = m_curr.copy(); frame_count=0
+
+        # ── Redraw (throttle to every 2nd frame) ──────────────────────────
+        if frame_n[0] % 2 != 0: return
+
+        # Remove old
+        if sphere_lc[0] is not None:
+            sphere_lc[0].remove(); sphere_lc[0]=None
+        for q in (dipole_q, gravity_q):
+            if q[0] is not None:
+                try: q[0].remove()
+                except: pass
+                q[0]=None
+
+        # Draw sphere lines rotated by sphere_rot
+        rotated = rotate_lines(SPHERE_LINES_BASE, sphere_rot)
+        segs=[]; cols=[]; lws=[]
+        for pts, col, lw in rotated:
+            # Break into segments for Line3DCollection
+            for i in range(len(pts)-1):
+                segs.append([pts[i], pts[i+1]])
+                cols.append(col)
+                lws.append(lw)
+        lc = Line3DCollection(segs, colors=cols, linewidths=lws, alpha=0.75)
+        ax.add_collection3d(lc)
+        sphere_lc[0] = lc
+
+        # Dipole arrow (red, long)
+        mx,my,mz = live['m']
+        dipole_q[0] = ax.quiver(0,0,0, mx,my,mz,
+                                 length=1.3, color='#ff2266',
+                                 linewidth=4, arrow_length_ratio=0.18,
+                                 normalize=True)
+
+        # Gravity arrow (blue, shorter)
+        gx,gy,gz = live['g']
+        gravity_q[0] = ax.quiver(0,0,0, gx,gy,gz,
+                                  length=0.8, color='#00aaff',
+                                  linewidth=2, arrow_length_ratio=0.18,
+                                  normalize=True)
+
+        # Title
+        ax.set_title(
+            f'Dipole [{mx:+.3f} {my:+.3f} {mz:+.3f}]   '
+            f'Gravity [{gx:+.2f} {gy:+.2f} {gz:+.2f}]',
+            color='#00e5ff', fontsize=9, pad=6
+        )
+
+        st.set_text(f'  {ser_status["msg"]}')
+        st.set_color('#44ff88' if ser_status['ok'] else '#ff6644')
+        st2.set_text(
+            f'  rx:{live["rx"]}   '
+            f'cycle:{frame_count}/{CYCLE_FRAMES}   '
+            f'sphere_rot: det={np.linalg.det(sphere_rot):.3f}'
+        )
+
+    ani = animation.FuncAnimation(
+        fig, update, interval=20,
+        blit=False, cache_frame_data=False,
+    )
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == '__main__':
+    run()
