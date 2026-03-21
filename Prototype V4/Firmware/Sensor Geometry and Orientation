@@ -1,0 +1,279 @@
+## Hardware
+
+### Microcontroller
+- STM32 (F4 series)
+- USB CDC serial @115200 baud
+
+### Sensors
+| Sensor | Bus | Purpose |
+|--------|-----|---------|
+| MMC5603 S1 | I2C1 | Ball tracking |
+| MMC5603 S2 | I2C2 | Ball tracking |
+| MMC5603 S3 | I2C3 | Compass (far from ball, reads Earth field) |
+| MPU6050 | I2C2 (shared with S2) | Accelerometer + Gyroscope |
+
+### Serial Format (12 values @115200)
+```
+ax, ay, az,         ← MPU6050 accel (raw/16384 → g)
+m1x, m1y, m1z,     ← S1 magnetometer raw counts
+m2x, m2y, m2z,     ← S2 magnetometer raw counts
+cx, cy, cz          ← S3 compass raw counts
+```
+
+---
+
+## Sensor Geometry
+
+### Pen Frame Convention
+```
++X = right, real world west
++Y = forward, Real world south(away from you when writing)
++Z = up towards the sky.
+```
+
+### Sensor Positions
+```
+S1: (0,    +1.0, +1.3) cm  [behind magnet]
+S2: (-1.2,  0,   +1.3) cm  [right of magnet]
+S3: ~13.5cm up pen barrel    [far from ball, reads Earth field only]
+```
+
+### Sensor Axis Orientations
+```
+S1:  sensor_x = pen -x
+     sensor_y = pen +Z
+     sensor_z = pen +y
+
+S2:  sensor_x = pen -Y
+     sensor_y = pen +Z
+     sensor_z = pen -X
+
+MPU6050 (accel + gyro):
+     sensor_x = pen -Z
+     sensor_y = pen +Y
+     sensor_z = pen +X
+
+S3 compass (MMC5603, X axis inverted):
+     sensor_x = pen -Y
+     sensor_y = pen +X
+     sensor_z = pen +Z
+```
+
+### Rotation Matrices (raw → pen frame: B_pen = R.T @ raw)
+```python
+R_S1 = np.array([[ 1,  0,  0],
+                 [ 0,  0,  1],
+                 [ 0, -1,  0]])
+
+R_S2 = np.array([[ 0,  1,  0],
+                 [ 0,  0,  1],
+                 [ 1,  0,  0]])
+
+R_acc = np.array([[ 0,  0, -1],
+                  [ 0,  1,  0],
+                  [ 1,  0,  0]])
+# IMPORTANT: gravity = -R_acc.T @ raw  (must negate)
+
+R_gyro = R_acc  # same chip, same orientation
+
+R_compass = np.array([[ 0, -1,  0],
+                      [ 1,  0,  0],
+                      [ 0,  0, -1]])
+```
+
+---
+
+## Core Algorithm
+
+### 1. Dipole Recovery (verified zero mathematical error)
+```python
+S1_pos = np.array([ 0.0, -1.0,  1.1])
+S2_pos = np.array([ 1.2,  0.0,  1.1])
+
+def jac(r):
+    rn = np.linalg.norm(r); rh = r/rn
+    return (3*np.outer(rh,rh) - np.eye(3)) / rn**3
+
+A = np.vstack([R_S1 @ jac(S1_pos),
+               R_S2 @ jac(S2_pos)])   # 6x3 matrix
+
+PINV_A = np.linalg.pinv(A)            # 3x6 pseudo-inverse
+
+def extract_dipole(raw1, raw2):
+    scale = (np.linalg.norm(raw1) + np.linalg.norm(raw2)) / 2
+    if scale < 1e-9: return None
+    b = np.concatenate([raw1, raw2]) / scale
+    m = PINV_A @ b
+    n = np.linalg.norm(m)
+    return m/n if n > 1e-9 else None
+```
+
+### 2. Gravity Recovery
+```python
+def recover_gravity(raw_accel):
+    g = R_acc.T @ raw_accel
+    n = np.linalg.norm(g)
+    return -g/n  # NEGATED — accel reads opposite to gravity direction
+```
+
+### 3. Compass Recovery
+```python
+def recover_compass(raw_compass):
+    b = R_compass.T @ raw_compass
+    n = np.linalg.norm(b)
+    return b/n if n > 1e-9 else np.array([0.,1.,0.])
+```
+
+### 4. World Frame Construction
+```python
+def build_world_frame(gravity_hat, compass_hat):
+    down      = gravity_hat / np.linalg.norm(gravity_hat)
+    north_raw = compass_hat - np.dot(compass_hat, down) * down
+    nn        = np.linalg.norm(north_raw)
+    north     = north_raw/nn if nn > 1e-6 else np.array([0.,1.,0.])
+    east      = np.cross(north, down)
+    east      = east / np.linalg.norm(east)
+    return east, north, down
+```
+
+### 5. Rotation Vector (core tracking)
+```python
+rv = np.cross(cycle_ref_m, m_curr)
+# |rv| = dα × sin(θ)
+# where θ = angle between dipole and rotation axis
+# dα = rotation angle between frames
+```
+
+### 6. Canvas Mapping
+```python
+rv_h  = rv - np.dot(rv, down) * down   # project to horizontal plane
+dx_mm = np.dot(rv_h, east)  * MM_PER_RAD  # canvas X (right)
+dy_mm = np.dot(rv_h, north) * MM_PER_RAD  # canvas Y (forward)
+```
+
+### 7. Cyclic Reset (eliminates drift)
+```python
+CYCLE_FRAMES = 5  # reset every 5 frames = every 10ms at 500Hz
+
+if frame_count >= CYCLE_FRAMES:
+    cycle_ref_m      = m_curr.copy()   # reset dipole reference
+    cycle_ref_canvas = canvas_pts[-1]  # continue from last point
+    frame_count      = 0
+```
+
+### 8. Sphere Rotation (for 3D visualiser)
+```python
+rv     = np.cross(ref_m, m_curr)
+rv_mag = np.linalg.norm(rv)
+if rv_mag > 1e-6:
+    axis  = rv / rv_mag
+    angle = rv_mag  # small angle approximation valid at 500Hz
+    c=np.cos(angle); s=np.sin(angle); t=1-c
+    x,y,z = axis
+    dR = np.array([[t*x*x+c,   t*x*y-s*z, t*x*z+s*y],
+                   [t*x*y+s*z, t*y*y+c,   t*y*z-s*x],
+                   [t*x*z-s*y, t*y*z+s*x, t*z*z+c  ]])
+    sphere_rot = dR @ sphere_rot
+
+# Re-orthogonalise every 200 frames to prevent drift
+if frame_count % 200 == 0:
+    U, _, Vt = np.linalg.svd(sphere_rot)
+    sphere_rot = U @ Vt
+```
+
+---
+
+## Firmware (main.c) Key Functions
+
+```c
+// Addresses
+#define MPU6050_ADDR  (0x68 << 1)
+#define MMC5603_ADDR  (0x30 << 1)
+
+// MMC5603 registers
+#define MMC_REG_DATA  0x00
+#define MMC_REG_CTRL0 0x1B
+#define MMC_CMD_SET   0x08
+#define MMC_CMD_RESET 0x10
+#define MMC_CMD_TM    0x01
+
+// Variables
+int16_t ax, ay, az;
+int32_t mx1,my1,mz1;  // S1
+int32_t mx2,my2,mz2;  // S2
+int32_t mx3,my3,mz3;  // S3 compass
+
+// Init all three MMC5603s
+mmc_set_reset(&hi2c1);
+mmc_set_reset(&hi2c2);
+mmc_set_reset(&hi2c3);
+
+// Main loop (2ms = 500Hz)
+while(1) {
+    if(HAL_GetTick()-last >= 2) {
+        last = HAL_GetTick();
+        mpu_read();
+        mmc_read(&hi2c1, &mx1,&my1,&mz1);
+        mmc_read(&hi2c2, &mx2,&my2,&mz2);
+        mmc_read(&hi2c3, &mx3,&my3,&mz3);
+        usb_send();
+    }
+}
+
+// Serial output
+sprintf(buf, "%d,%d,%d,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld\r\n",
+        ax,ay,az,
+        mx1,my1,mz1,
+        mx2,my2,mz2,
+        mx3,my3,mz3);
+```
+
+---
+
+## Key Physics Discoveries
+
+### 1. Blind Spot
+```
+rv = cross(m_prev, m_curr)
+|rv| = dα × sin(θ)
+
+When θ = 0 (dipole aligns with rotation axis):
+  sin(0) = 0 → signal disappears
+  This is physical — the magnetic field literally does not change
+  No number of magnetometers can fix this
+  Only a quadrupole magnet or gyroscope can cover it
+  In practice: rare and brief during normal writing
+```
+
+### 2. Cross Product is Already Spin-Free
+```
+rv = cross(m_prev, m_curr) is ALWAYS perpendicular to m_prev
+Spin removal via m_neutral subtraction = mathematical no-op
+No spin removal code needed
+```
+
+### 3. Direction Ambiguity
+```
+rv direction depends on current dipole orientation
+Same physical forward roll → different rv direction
+as dipole drifts over time
+Fix: project rv onto horizontal plane using gravity,
+     then onto compass-defined North/East axes
+```
+
+### 4. MMC5603 vs BMM150
+```
+MMC5603: SET/RESET technique → rejects 50Hz AC interference ✓
+BMM150:  Hall effect, no SET/RESET → 50Hz noise corrupts readings ✗
+Use MMC5603 for compass — BMM150 unusable in normal environments
+```
+
+### 5. Small Angle Approximation
+```
+At 500Hz sampling: rotation per frame ≈ 1° = 0.017 rad
+sin(0.017) = 0.017000 (exact)
+Error = 0.00001% → completely negligible
+Justifies treating |rv| ≈ rotation angle directly
+```
+
+---
