@@ -26,8 +26,11 @@ it tracks the line but in random direction on python simulation due to lack of d
    since  |rv| = dα × sin(θ)          rv is rotation vector, cross product of previous dipole orientation(M_previous) and new dipole orientation(M_new).
    therefore,
    θ = 90°   →   |rv| = dα × 1     = dα        ← full signal, perfect
+   
    θ = 45°   →   |rv| = dα × 0.707 = 0.707·dα  ← 30% underestimate
+   
    θ = 10°   →   |rv| = dα × 0.174 = 0.174·dα  ← 83% underestimate
+   
    θ = 0°    →   |rv| = dα × 0     = 0          ← blind spot, total signal loss
 
    this issue can be solved methamatically.
