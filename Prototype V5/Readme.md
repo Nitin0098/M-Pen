@@ -7,7 +7,7 @@ however for complex shapes and text it requires some plot algorithm changes.
 
 1. previously I used |rotation vector| ≈ dα to calculate the change in rotation of dipole
 in a small time dt but the full equation is  |rotation vector| ≈ dα x sin(theta), so i have updated
-the code to correct equation for better accuracy and low noise.
+the code to correct equation for better accuracy and low noise
 2. Updated the IMU unit now it can detect the direction of gravity and north pole accurately, which is necessary for canvas plotting of the rotation of ball.
 3. the orientation of sensors(magnetometer, Accelerometer, gyroscope and compass) is optimised.
 4. direction issue is solved, previously during tests when I draw a line in right direction using prototype
