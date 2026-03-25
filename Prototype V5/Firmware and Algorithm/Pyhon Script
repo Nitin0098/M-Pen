@@ -1,0 +1,368 @@
+"""
+digital_pen_canvas.py
+─────────────────────────────────────────────────────────────────
+Serial thread  → computes (dx,dy), appends to deque
+GUI thread     → drains deque, draws to PIL, blits ONE image
+O(1) render cost forever.
+─────────────────────────────────────────────────────────────────
+Pen Frame:  +X=right(West)  +Y=forward(South)  +Z=up
+Canvas:     +X=right on paper  +Y=forward/up on screen
+─────────────────────────────────────────────────────────────────
+"""
+
+import sys
+import time
+import threading
+from collections import deque
+
+import tkinter as tk
+import numpy as np
+import serial
+import serial.tools.list_ports
+from PIL import Image, ImageDraw, ImageTk
+
+# ── CONFIG ────────────────────────────────────────────────────────
+BAUD         = 115200
+MM_PER_RAD   = 28.0
+CYCLE_FRAMES = 5
+MIN_SIG      = 50
+LIFT_THRESH  = 0.15
+WF_ALPHA     = 0.05
+W_MM         = 210
+H_MM         = 297
+PX_MM        = 3
+LINE_W       = 2
+LINE_COL     = (20, 20, 40, 230)
+BG_COL       = (253, 250, 244, 255)
+GRID_COL     = (220, 210, 195, 255)
+# ─────────────────────────────────────────────────────────────────
+
+PW = W_MM * PX_MM   # canvas pixel width
+PH = H_MM * PX_MM   # canvas pixel height
+
+
+# ── ROTATION MATRICES ─────────────────────────────────────────────
+R_S1  = np.array([[-1, 0, 0], [ 0, 0, 1], [ 0, 1, 0]], dtype=float)
+R_S2  = np.array([[ 0,-1, 0], [ 0, 0, 1], [-1, 0, 0]], dtype=float)
+R_acc = np.array([[ 0, 0,-1], [ 0, 1, 0], [ 1, 0, 0]], dtype=float)
+R_cmp = np.array([[ 0,-1, 0], [ 1, 0, 0], [ 0, 0, 1]], dtype=float)
+
+
+# ── DIPOLE RECOVERY ───────────────────────────────────────────────
+S1p = np.array([ 0.0, +1.0, +1.3])
+S2p = np.array([-1.2,  0.0, +1.3])
+
+def _jac(r):
+    rn = np.linalg.norm(r)
+    rh = r / rn
+    return (3 * np.outer(rh, rh) - np.eye(3)) / rn**3
+
+PINV = np.linalg.pinv(np.vstack([R_S1 @ _jac(S1p),
+                                  R_S2 @ _jac(S2p)]))
+
+def get_dipole(r1, r2):
+    s = (np.linalg.norm(r1) + np.linalg.norm(r2)) / 2.0
+    if s < 1e-9:
+        return None, 0.0
+    m = PINV @ (np.concatenate([r1, r2]) / s)
+    n = np.linalg.norm(m)
+    return (m / n, s) if n > 1e-9 else (None, 0.0)
+
+def get_gravity(raw):
+    g = R_acc.T @ raw
+    n = np.linalg.norm(g)
+    return (-g / n) if n > 1e-9 else np.array([0., 0., -1.])
+
+def get_compass(raw):
+    b = R_cmp.T @ raw
+    n = np.linalg.norm(b)
+    return (b / n) if n > 1e-9 else np.array([0., 1., 0.])
+
+def get_world(grav, comp):
+    """Returns (east, north, down) unit vectors in pen frame."""
+    down  = grav / np.linalg.norm(grav)
+    nr    = comp - np.dot(comp, down) * down
+    nn    = np.linalg.norm(nr)
+    north = nr / nn if nn > 1e-6 else np.array([0., 1., 0.])
+    east  = np.cross(north, down)
+    return east / np.linalg.norm(east), north, down
+
+
+# ── QUEUE  (serial thread → GUI thread) ──────────────────────────
+# Items: (dx_mm, dy_mm)  or  None (= pen lift)
+_q     = deque()
+_qlock = threading.Lock()
+
+def q_put(item):
+    with _qlock:
+        _q.append(item)
+
+def q_drain():
+    with _qlock:
+        out = list(_q)
+        _q.clear()
+    return out
+
+
+# ── GLOBALS shared between threads ────────────────────────────────
+running = True
+scale   = 1.0   # GIL-safe: only simple float reads/writes
+
+
+# ── SERIAL THREAD ─────────────────────────────────────────────────
+def serial_thread(port):
+    global running
+    try:
+        ser = serial.Serial(port, BAUD, timeout=1)
+        print(f"[OK] {port} @ {BAUD}")
+    except Exception as e:
+        print(f"[ERR] {e}")
+        running = False
+        return
+
+    east = north = down = None
+    ref_m = prev_m = None
+    frame = 0
+
+    while running:
+        try:
+            line = ser.readline().decode("ascii", errors="ignore")
+        except Exception:
+            continue
+
+        try:
+            v = [float(x) for x in line.strip().split(",")]
+            if len(v) != 12:
+                continue
+        except ValueError:
+            continue
+
+        ra = np.array(v[0:3])
+        r1 = np.array(v[3:6])
+        r2 = np.array(v[6:9])
+        rc = np.array(v[9:12])
+
+        m, sig = get_dipole(r1, r2)
+        if m is None or sig < MIN_SIG:
+            continue
+
+        gv = get_gravity(ra)
+        cp = get_compass(rc)
+        e, n, d = get_world(gv, cp)
+
+        # ── smooth world frame (EMA) ──────────────────────────────
+        a = WF_ALPHA
+        if east is None:
+            east, north, down = e.copy(), n.copy(), d.copy()
+        else:
+            east  += a * (e - east)
+            north += a * (n - north)
+            down  += a * (d - down)
+            down  /= np.linalg.norm(down)
+            nr = north - np.dot(north, down) * down
+            nn = np.linalg.norm(nr)
+            if nn > 1e-6:
+                north = nr / nn
+            east = np.cross(north, down)
+            east /= np.linalg.norm(east)
+
+        # ── pen lift detection ────────────────────────────────────
+        if prev_m is not None and np.linalg.norm(m - prev_m) > LIFT_THRESH:
+            q_put(None)
+            ref_m = None
+            frame = 0
+            prev_m = m
+            continue
+        prev_m = m
+
+        # ── cyclic rotation vector ────────────────────────────────
+        if ref_m is None:
+            ref_m = m.copy()
+            frame = 0
+            continue
+
+        rv = np.cross(ref_m, m)
+        frame += 1
+        if frame >= CYCLE_FRAMES:
+            ref_m = m.copy()
+            frame = 0
+
+        # ── canvas displacement ───────────────────────────────────
+        # Roll right (+X pen) → rotation axis = +Y pen (South)
+        # rv ≈ +Y pen → dot(rv, north≈-Y) = -1 → dx = -(-1) = +1 ✓
+        # Roll forward (+Y pen) → rotation axis = -X pen (East)
+        # rv ≈ East → dot(rv, east≈-X) depends on geometry → dy sign set by test
+        rv_h = rv - np.dot(rv, down) * down
+        dx   = -np.dot(rv_h, north) * MM_PER_RAD * scale
+        dy   = -np.dot(rv_h, east)  * MM_PER_RAD * scale
+
+        q_put((dx, dy))
+
+    ser.close()
+
+
+# ── BITMAP HELPERS ────────────────────────────────────────────────
+def new_image():
+    img  = Image.new("RGBA", (PW, PH), BG_COL)
+    draw = ImageDraw.Draw(img)
+    # vertical grid lines
+    for xmm in range(0, W_MM + 1, 10):
+        px = xmm * PX_MM
+        draw.line([(px, 0), (px, PH)], fill=GRID_COL, width=1)
+    # horizontal grid lines
+    for ymm in range(0, H_MM + 1, 10):
+        py = (H_MM - ymm) * PX_MM
+        draw.line([(0, py), (PW, py)], fill=GRID_COL, width=1)
+    return img, draw
+
+def mm2px(x_mm, y_mm):
+    """mm (Y-up) → pixel coords (Y-down). Returns ints for PIL."""
+    return int(x_mm * PX_MM), int((H_MM - y_mm) * PX_MM)
+
+
+# ── GUI ───────────────────────────────────────────────────────────
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Digital Pen")
+        self.configure(bg="#1a1a2e")
+        self.resizable(True, True)
+
+        # ── toolbar ──────────────────────────────────────────────
+        bar = tk.Frame(self, bg="#1a1a2e", pady=6)
+        bar.pack(side=tk.TOP, fill=tk.X, padx=8)
+
+        tk.Button(bar, text="⟳  RESET",
+                  command=self.do_reset,
+                  bg="#e63946", fg="white", relief="flat",
+                  font=("Helvetica", 11, "bold"),
+                  padx=18, pady=6, cursor="hand2",
+                  activebackground="#c1121f",
+                  activeforeground="white").pack(side=tk.LEFT, padx=4)
+
+        self.scale_lbl = tk.Label(bar, text="scale  1.00×",
+                                  bg="#1a1a2e", fg="#666680",
+                                  font=("Helvetica", 9))
+        self.scale_lbl.pack(side=tk.LEFT, padx=12)
+
+        for txt, cmd in [("＋", self.scale_up), ("−", self.scale_dn)]:
+            tk.Button(bar, text=txt, command=cmd,
+                      bg="#16213e", fg="#a8dadc", relief="flat",
+                      font=("Helvetica", 12, "bold"),
+                      padx=10, pady=4,
+                      cursor="hand2").pack(side=tk.LEFT, padx=2)
+
+        # ── drawing canvas ────────────────────────────────────────
+        self.cv = tk.Canvas(self, width=PW, height=PH,
+                            bg="#fdfaf4", highlightthickness=0,
+                            cursor="crosshair")
+        self.cv.pack(padx=8, pady=(0, 8))
+
+        # Single PIL image → single PhotoImage on canvas (O(1) forever)
+        self.img, self.draw = new_image()
+        self._photo  = ImageTk.PhotoImage(self.img)
+        self._img_id = self.cv.create_image(0, 0, anchor=tk.NW,
+                                            image=self._photo)
+
+        # pen state (GUI thread only — no lock needed)
+        self.cx       = float(W_MM) / 2.0
+        self.cy       = float(H_MM) / 2.0
+        self.pen_down = True
+        self._dirty   = False
+
+        # current-position dot (always on top)
+        r = 4
+        px, py = mm2px(self.cx, self.cy)
+        self._dot = self.cv.create_oval(px-r, py-r, px+r, py+r,
+                                        fill="#e63946", outline="")
+
+        self.protocol("WM_DELETE_WINDOW", self._quit)
+        self._poll()
+
+    # ── 60fps poll ────────────────────────────────────────────────
+    def _poll(self):
+        for item in q_drain():
+            if item is None:              # pen lifted
+                self.pen_down = False
+                continue
+
+            dx, dy = item
+            nx = max(0.0, min(self.cx + dx, float(W_MM)))
+            ny = max(0.0, min(self.cy + dy, float(H_MM)))
+
+            if self.pen_down:
+                x0, y0 = mm2px(self.cx, self.cy)
+                x1, y1 = mm2px(nx, ny)
+                self.draw.line([(x0, y0), (x1, y1)],
+                               fill=LINE_COL, width=LINE_W)
+                self._dirty = True
+
+            self.cx, self.cy = nx, ny
+            self.pen_down = True
+
+        # re-blit only when pixels changed
+        if self._dirty:
+            self._photo = ImageTk.PhotoImage(self.img)
+            self.cv.itemconfig(self._img_id, image=self._photo)
+            self._dirty = False
+
+        # dot: always update position (cheap coords call)
+        r = 4
+        px, py = mm2px(self.cx, self.cy)
+        self.cv.coords(self._dot, px-r, py-r, px+r, py+r)
+        self.cv.tag_raise(self._dot)
+
+        self.after(16, self._poll)
+
+    # ── buttons ───────────────────────────────────────────────────
+    def do_reset(self):
+        global scale
+        q_drain()                              # flush pending deltas
+        self.img, self.draw = new_image()      # fresh bitmap
+        self._photo = ImageTk.PhotoImage(self.img)
+        self.cv.itemconfig(self._img_id, image=self._photo)
+        self.cx, self.cy  = float(W_MM) / 2.0, float(H_MM) / 2.0
+        self.pen_down     = True
+        self._dirty       = False
+        scale             = 1.0
+        self.scale_lbl.config(text="scale  1.00×")
+
+    def scale_up(self):
+        global scale
+        scale = min(scale * 1.25, 10.0)
+        self.scale_lbl.config(text=f"scale  {scale:.2f}×")
+
+    def scale_dn(self):
+        global scale
+        scale = max(scale / 1.25, 0.1)
+        self.scale_lbl.config(text=f"scale  {scale:.2f}×")
+
+    def _quit(self):
+        global running
+        running = False
+        self.destroy()
+
+
+# ── ENTRY POINT ───────────────────────────────────────────────────
+def find_port():
+    for p in serial.tools.list_ports.comports():
+        if any(k in (p.description or "").lower()
+               for k in ["stm32", "stlink", "cdc", "virtual com"]):
+            return p.device
+    pts = serial.tools.list_ports.comports()
+    return pts[0].device if pts else None
+
+
+if __name__ == "__main__":
+    port = sys.argv[1] if len(sys.argv) > 1 else find_port()
+    if port is None:
+        print("No serial port found.")
+        print("Usage: python digital_pen_canvas.py <PORT>")
+        sys.exit(1)
+
+    t = threading.Thread(target=serial_thread, args=(port,), daemon=True)
+    t.start()
+    time.sleep(0.3)
+
+    App().mainloop()
+    t.join(timeout=2)
