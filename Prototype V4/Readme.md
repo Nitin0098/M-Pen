@@ -7,7 +7,7 @@ Improvements I made
 3. Distance between the magnetometers and magnet reduced and carefully adjusted to certain values, which resulted in increased signat to magnetometers.
 
 PROBLEM 1:
-when magnet ball rotates along the dipole axis, it produces no change in magnetic field, so magnetometers cannot detect rotation of magnet along dipole axis, its like a smooth cylinder rotating along its axis, practically no sensor arrangement can detect it.
+when magnet ball rotates along the dipole axis, it produces no change in magnetic field, so magnetometers cannot detect rotation of magnet along dipole axis, its like a smooth cylinder rotating along its axis, practically no sensor arrangement can detect it. also known as blind axis problem.
 
 How I solved it:
 I have 2 solutions for this problem;
